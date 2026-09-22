@@ -24,6 +24,7 @@ use n0_future::{
     time::{self, Duration},
 };
 use n0_mainline::{Dht, DhtBuilder, MutableItem};
+use tokio::{sync::oneshot, task::JoinSet};
 // DEFAULT_PKARR_TTL is private to iroh's pkarr module; redefine it here.
 const DEFAULT_PKARR_TTL: u32 = 30;
 
@@ -72,6 +73,8 @@ fn mutable_item_to_signed_packet(
 /// This implements the [`AddressLookup`] trait to be used as an address lookup service which can
 /// be used as both a publisher and resolver.  Calling [`DhtAddressLookup::publish`] will start
 /// a background task that periodically publishes the endpoint address.
+/// Dropping the last clone stops publication and cancels outstanding lookups,
+/// including lookups whose returned streams are no longer being polled.
 ///
 /// [`DhtAddressLookup`] filters published addresses: only relay addresses are published by default.
 /// To change this behavior, use [`Builder::addr_filter`] and set it to e.g. [`AddrFilter::unfiltered`].
@@ -92,6 +95,9 @@ struct Inner {
     ///
     /// Due to [`AbortOnDropHandle`], this will be aborted when the Address Lookup is dropped.
     task: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// Lookup tasks are owned here, rather than by the returned result streams.
+    /// Dropping the last provider aborts them even if callers retain those streams.
+    lookups: Mutex<JoinSet<()>>,
     /// Optional keypair for signing the DNS packets.
     ///
     /// If this is None, the endpoint will not publish its address to the DHT.
@@ -106,13 +112,12 @@ struct Inner {
 
 impl Inner {
     async fn resolve_dht(
-        &self,
+        dht: &Dht,
         public_key: EndpointId,
     ) -> Option<Result<AddressLookupItem, AddressLookupError>> {
         tracing::info!("resolving {} from DHT", public_key.to_z32());
 
-        let maybe_item = self
-            .dht
+        let maybe_item = dht
             .get_mutable_most_recent(public_key.as_bytes(), None)
             .await
             .ok()
@@ -237,6 +242,7 @@ impl Builder {
             secret_key,
             republish_delay: self.republish_delay,
             task: Default::default(),
+            lookups: Default::default(),
             filter: self.addr_filter,
         })))
     }
@@ -262,17 +268,16 @@ impl DhtAddressLookup {
     /// Publishes the current endpoint information to the DHT and refreshes it periodically.
     ///
     /// We publish without CAS. We assume a single logical writer per endpoint key.
-    async fn publish_loop(self, signed_packet: SignedPacket) {
-        let this = self;
+    async fn publish_loop(dht: Dht, republish_delay: Duration, signed_packet: SignedPacket) {
         let public_key = signed_packet.public_key();
         let z32 = public_key.to_z32();
         let item = signed_packet_to_mutable_item(&signed_packet);
-        let Ok(info) = this.0.dht.info().await else {
+        let Ok(info) = dht.info().await else {
             tracing::error!("failed to read dht info; stopping publish task");
             return;
         };
         if info.routing_table_size() == 0 {
-            let Ok(bootstrapped) = this.0.dht.bootstrapped().await else {
+            let Ok(bootstrapped) = dht.bootstrapped().await else {
                 tracing::error!("dht bootstrap probe failed; stopping publish task");
                 return;
             };
@@ -292,7 +297,7 @@ impl DhtAddressLookup {
         }
 
         loop {
-            let res = this.0.dht.put_mutable(item.clone(), None).await;
+            let res = dht.put_mutable(item.clone(), None).await;
             match res {
                 Ok(_) => {
                     tracing::debug!("pkarr publish success. published under {z32}");
@@ -307,7 +312,7 @@ impl DhtAddressLookup {
                     tracing::warn!("pkarr publish error: {}", e);
                 }
             }
-            time::sleep(this.0.republish_delay).await;
+            time::sleep(republish_delay).await;
         }
     }
 }
@@ -333,8 +338,11 @@ impl AddressLookup for DhtAddressLookup {
             tracing::warn!("failed to create signed packet");
             return;
         };
-        let this = self.clone();
-        let curr = task::spawn(this.publish_loop(signed_packet));
+        let curr = task::spawn(Self::publish_loop(
+            self.0.dht.clone(),
+            self.0.republish_delay,
+            signed_packet,
+        ));
         let mut task = self.0.task.lock().expect("poisoned");
         *task = Some(AbortOnDropHandle::new(curr));
     }
@@ -345,21 +353,42 @@ impl AddressLookup for DhtAddressLookup {
     ) -> Option<BoxStream<Result<AddressLookupItem, AddressLookupError>>> {
         let z32 = endpoint_id.to_z32();
         tracing::info!("resolving {} as {}", endpoint_id, z32);
-        let address_lookup = self.0.clone();
-        let stream =
-            n0_future::stream::once_future(
-                async move { address_lookup.resolve_dht(endpoint_id).await },
-            )
-            .filter_map(|x| x)
-            .boxed();
+        let address_lookup = Arc::downgrade(&self.0);
+        let stream = n0_future::stream::once_future(async move {
+            let receiver = {
+                let inner = address_lookup.upgrade()?;
+                let dht = inner.dht.clone();
+                let (mut sender, receiver) = oneshot::channel();
+                let mut lookups = inner.lookups.lock().expect("poisoned");
+                while lookups.try_join_next().is_some() {}
+                lookups.spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = sender.closed() => {}
+                        result = Inner::resolve_dht(&dht, endpoint_id) => {
+                            let _ = sender.send(result);
+                        }
+                    }
+                });
+                receiver
+            };
+            receiver.await.ok().flatten()
+        })
+        .filter_map(|x| x)
+        .boxed();
         Some(stream)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::BTreeSet,
+        net::{SocketAddrV4, UdpSocket},
+        task::{Context, Waker},
+    };
 
+    use iroh::address_lookup::AddressLookupServices;
     use iroh_base::{RelayUrl, TransportAddr};
     use n0_error::{Result, StdResultExt};
     use n0_mainline::Testnet;
@@ -367,6 +396,101 @@ mod tests {
     use url::Url;
 
     use super::*;
+
+    async fn local_lookup() -> (DhtAddressLookup, SocketAddrV4, UdpSocket) {
+        // Keep a silent bootstrap socket open so lookups stay pending without Internet access.
+        let bootstrap = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut builder = DhtBuilder::default();
+        builder
+            .bootstrap(&[bootstrap.local_addr().unwrap()])
+            .port(0);
+        let lookup = DhtAddressLookup::builder()
+            .secret_key(SecretKey::generate())
+            .dht_builder(builder)
+            .build()
+            .unwrap();
+        let address = lookup.0.dht.info().await.unwrap().local_addr();
+        (lookup, address, bootstrap)
+    }
+
+    async fn assert_socket_released(address: SocketAddrV4) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match UdpSocket::bind(address) {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("failed to rebind DHT socket: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("DHT socket retained after dropping the last provider");
+    }
+
+    #[tokio::test]
+    async fn dropping_last_provider_stops_publication() {
+        let (lookup, address, _bootstrap) = local_lookup().await;
+        let weak = Arc::downgrade(&lookup.0);
+        let retained = lookup.clone();
+        let registry = AddressLookupServices::default();
+        registry.add(lookup);
+        retained.publish(&EndpointData::from_iter([TransportAddr::Relay(
+            "https://example.com".parse().unwrap(),
+        )]));
+        tokio::task::yield_now().await;
+        registry.clear();
+        assert!(weak.upgrade().is_some(), "a provider clone is still alive");
+        drop(retained);
+        assert!(weak.upgrade().is_none(), "publisher retained its owner");
+        assert_socket_released(address).await;
+    }
+
+    #[tokio::test]
+    async fn clearing_registry_cancels_unpolled_and_pending_lookups() {
+        for poll_first in [false, true] {
+            let (lookup, address, _bootstrap) = local_lookup().await;
+            let weak = Arc::downgrade(&lookup.0);
+            let registry = AddressLookupServices::default();
+            registry.add(lookup);
+            let mut stream = Box::pin(registry.resolve(SecretKey::generate().public()));
+            if poll_first {
+                assert!(
+                    std::pin::pin!(stream.next())
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                tokio::task::yield_now().await;
+            }
+            registry.clear();
+            assert!(weak.upgrade().is_none(), "lookup retained its owner");
+            // Release the DHT while the consumer retains a stream without polling it again.
+            assert_socket_released(address).await;
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_result_stream_cancels_lookup_task() {
+        let (lookup, _, _bootstrap) = local_lookup().await;
+        let mut stream = lookup.resolve(SecretKey::generate().public()).unwrap();
+        assert!(
+            std::pin::pin!(stream.next())
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        tokio::task::yield_now().await;
+        drop(stream);
+        let mut tasks = std::mem::take(&mut *lookup.0.lookups.lock().unwrap());
+        assert_eq!(tasks.len(), 1);
+        tokio::time::timeout(Duration::from_secs(2), tasks.join_next())
+            .await
+            .expect("lookup task ignored a dropped result stream")
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "flaky"]
