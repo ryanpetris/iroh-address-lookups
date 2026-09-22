@@ -394,7 +394,7 @@ impl MdnsAddressLookup {
                                 sender.send(Ok(item.clone())).await.ok();
                             }
                         }
-                        entry.or_insert(peer_info);
+                        entry.insert_entry(peer_info);
 
                         // only send endpoints to the `subscriber` if they weren't explicitly resolved
                         // in other words, endpoints sent to the `subscribers` should only be the ones that
@@ -670,6 +670,49 @@ mod tests {
             assert_eq!(s1_endpoint_info.data, endpoint_data);
             assert_eq!(s2_endpoint_info.data, endpoint_data);
 
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn mdns_new_lookup_uses_changed_peer_address() -> Result {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1u64);
+            let (_, listener) = make_address_lookup(&mut rng, false)?;
+            let (peer_id, publisher) = make_address_lookup(&mut rng, true)?;
+            let mut events = listener.subscribe().await;
+
+            for port in [11111, 22222] {
+                let address: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+                let data = EndpointData::from_iter([TransportAddr::Ip(address)]);
+                publisher.publish(&data);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let event = events.next().await.expect("discovery stream closed");
+                        if let DiscoveryEvent::Discovered { endpoint_info, .. } = event
+                            && endpoint_info.endpoint_id == peer_id
+                            && endpoint_info.data == data
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .std_context("changed address was not announced")?;
+            }
+
+            let mut lookup = listener.resolve(peer_id).unwrap();
+            let item = tokio::time::timeout(Duration::from_secs(2), lookup.next())
+                .await
+                .std_context("cached lookup timed out")?
+                .expect("lookup stream closed")?;
+            assert_eq!(
+                item.endpoint_info()
+                    .data
+                    .ip_addrs()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec!["0.0.0.0:22222".parse::<SocketAddr>().unwrap()]
+            );
             Ok(())
         }
 
