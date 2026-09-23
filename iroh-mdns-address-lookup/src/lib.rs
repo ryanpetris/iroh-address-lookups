@@ -54,8 +54,8 @@
 //! [`AddrFilter`]: iroh::address_lookup::AddrFilter
 //! [`RelayUrl`]: iroh_base::RelayUrl
 use std::{
-    collections::{BTreeSet, HashMap},
-    net::{IpAddr, SocketAddr},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     str::FromStr,
     sync::Arc,
 };
@@ -111,7 +111,8 @@ pub struct MdnsAddressLookup {
 
 #[derive(Debug)]
 enum Message {
-    Discovered(String, Peer),
+    NetworkChanged(NetworkState),
+    Discovered(u64, String, Peer),
     Resolve(
         EndpointId,
         mpsc::Sender<Result<AddressLookupItem, AddressLookupError>>,
@@ -276,18 +277,44 @@ impl MdnsAddressLookup {
         let (send, mut recv) = mpsc::channel(64);
         let task_sender = send.clone();
         let rt = tokio::runtime::Handle::current();
-        let address_lookup = MdnsAddressLookup::spawn_discoverer(
+        let mut current_network = local_network();
+        let mut generation = 0;
+        let mut address_lookup = MdnsAddressLookup::spawn_discoverer(
             endpoint_id,
-            advertise,
             task_sender.clone(),
-            BTreeSet::new(),
-            service_name,
+            service_name.clone(),
+            generation,
             &rt,
         )?;
 
         let local_addrs: Watchable<Option<EndpointData>> = Watchable::default();
         let mut addrs_change = local_addrs.watch();
         let address_lookup_fut = async move {
+            // Route-only changes may not update netwatch's published interface state.
+            let network_sender = task_sender.clone();
+            let mut observed_network = current_network.clone();
+            let _network_monitor = AbortOnDropHandle::new(task::spawn(async move {
+                let mut poll = time::interval(Duration::from_secs(1));
+                poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                loop {
+                    poll.tick().await;
+                    let network = local_network();
+                    if network == observed_network {
+                        continue;
+                    }
+                    observed_network = network.clone();
+                    if network_sender
+                        .send(Message::NetworkChanged(network))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+            let mut pending_network = None;
+            let mut retry = time::interval(Duration::from_secs(1));
+            retry.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             let mut endpoint_addrs: HashMap<PublicKey, Peer> = HashMap::default();
             let mut subscribers = Subscribers::new();
             let mut last_id = 0;
@@ -299,30 +326,15 @@ impl MdnsAddressLookup {
             loop {
                 trace!(?endpoint_addrs, "Mdns Service loop tick");
                 let msg = tokio::select! {
+                    _ = retry.tick(), if pending_network.is_some() => {
+                        Some(Message::NetworkChanged(pending_network.take().unwrap()))
+                    }
                     msg = recv.recv() => {
                         msg
                     }
                     Ok(Some(data)) = addrs_change.updated() => {
                         tracing::trace!(?data, "Mdns address changed");
-                        address_lookup.remove_all();
-
-                        // apply user-supplied filter
-                        let data = data.apply_filter(&filter).into_owned();
-
-
-                        let addrs =
-                            MdnsAddressLookup::socketaddrs_to_addrs(data.ip_addrs());
-                        for addr in addrs {
-                            address_lookup.add(addr.0, addr.1)
-                        }
-                        if let Some(relay) = data.relay_urls().next()
-                            && let Err(err) = address_lookup.set_txt_attribute(RELAY_URL_ATTRIBUTE.to_string(), Some(relay.to_string()))  {
-                                warn!("Failed to set the relay url in mDNS: {err:?}");
-                        }
-                        if let Some(user_data) = data.user_data()
-                            && let Err(err) = address_lookup.set_txt_attribute(USER_DATA_ATTRIBUTE.to_string(), Some(user_data.to_string())) {
-                                warn!("Failed to set the user-defined data in mDNS: {err:?}");
-                        }
+                        publish_discoverer(&address_lookup, &data, &filter);
                         continue;
                     }
                 };
@@ -337,7 +349,44 @@ impl MdnsAddressLookup {
                     Some(msg) => msg,
                 };
                 match msg {
-                    Message::Discovered(discovered_endpoint_id, peer_info) => {
+                    Message::NetworkChanged(network) => {
+                        if network == current_network {
+                            pending_network = None;
+                            continue;
+                        }
+                        debug!(?network, "updating mDNS network");
+                        match Self::spawn_discoverer(
+                            endpoint_id,
+                            task_sender.clone(),
+                            service_name.clone(),
+                            generation + 1,
+                            &rt,
+                        ) {
+                            Ok(replacement) => {
+                                address_lookup = replacement;
+                                current_network = network;
+                                pending_network = None;
+                                generation += 1;
+                                // The replaced discoverer can no longer expire its peers.
+                                for (endpoint_id, _) in endpoint_addrs.drain() {
+                                    subscribers.send(DiscoveryEvent::Expired { endpoint_id });
+                                }
+                                if let Some(data) = addrs_change.get() {
+                                    publish_discoverer(&address_lookup, &data, &filter);
+                                }
+                            }
+                            Err(error) => {
+                                // A replacement interface may exist before its multicast
+                                // route. Retry without discarding the old cache or generation.
+                                pending_network = Some(network);
+                                warn!(?error, "could not update mDNS interfaces; retrying");
+                            }
+                        }
+                    }
+                    Message::Discovered(source_generation, discovered_endpoint_id, peer_info) => {
+                        if source_generation != generation {
+                            continue;
+                        }
                         trace!(
                             ?discovered_endpoint_id,
                             ?peer_info,
@@ -394,7 +443,7 @@ impl MdnsAddressLookup {
                                 sender.send(Ok(item.clone())).await.ok();
                             }
                         }
-                        entry.or_insert(peer_info);
+                        entry.insert_entry(peer_info);
 
                         // only send endpoints to the `subscriber` if they weren't explicitly resolved
                         // in other words, endpoints sent to the `subscribers` should only be the ones that
@@ -471,10 +520,9 @@ impl MdnsAddressLookup {
 
     fn spawn_discoverer(
         endpoint_id: PublicKey,
-        advertise: bool,
         sender: mpsc::Sender<Message>,
-        socketaddrs: BTreeSet<SocketAddr>,
         service_name: String,
+        generation: u64,
         rt: &tokio::runtime::Handle,
     ) -> Result<DropGuard, AddressLookupBuilderError> {
         let spawn_rt = rt.clone();
@@ -486,7 +534,7 @@ impl MdnsAddressLookup {
             let peer = peer.clone();
             spawn_rt.spawn(async move {
                 sender
-                    .send(Message::Discovered(endpoint_id, peer))
+                    .send(Message::Discovered(generation, endpoint_id, peer))
                     .await
                     .ok();
             });
@@ -494,15 +542,9 @@ impl MdnsAddressLookup {
         let endpoint_id_str = data_encoding::BASE32_NOPAD
             .encode(endpoint_id.as_bytes())
             .to_ascii_lowercase();
-        let mut discoverer = Discoverer::new_interactive(service_name, endpoint_id_str)
+        let discoverer = Discoverer::new_interactive(service_name, endpoint_id_str)
             .with_callback(callback)
             .with_ip_class(IpClass::Auto);
-        if advertise {
-            let addrs = MdnsAddressLookup::socketaddrs_to_addrs(socketaddrs.iter());
-            for addr in addrs {
-                discoverer = discoverer.with_addrs(addr.0, addr.1);
-            }
-        }
         discoverer
             .spawn(rt)
             .map_err(|e| AddressLookupBuilderError::from_err("mdns", e))
@@ -519,6 +561,69 @@ impl MdnsAddressLookup {
                 .or_insert(vec![socketaddr.ip()]);
         }
         addrs
+    }
+}
+
+// Include the OS index: an interface can be replaced while keeping its addresses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NetworkState {
+    interfaces: BTreeMap<u32, BTreeSet<IpAddr>>,
+    multicast_v4_source: Option<IpAddr>,
+}
+
+fn local_network() -> NetworkState {
+    // Auto can start with only IPv6 while the IPv4 multicast route is missing.
+    // Watch route choice too, so restoring that route reopens the IPv4 receiver.
+    // UDP connect selects a route without sending packets or joining the group.
+    let multicast_v4_source = (|| {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        socket.connect((Ipv4Addr::new(224, 0, 0, 251), 5353)).ok()?;
+        Some(socket.local_addr().ok()?.ip())
+    })();
+    NetworkState {
+        interfaces: local_interfaces(),
+        multicast_v4_source,
+    }
+}
+
+fn local_interfaces() -> BTreeMap<u32, BTreeSet<IpAddr>> {
+    netdev::get_interfaces()
+        .into_iter()
+        .filter(|interface| interface.is_up() && interface.is_multicast())
+        .map(|interface| {
+            let addrs = interface
+                .ipv4
+                .into_iter()
+                .map(|network| IpAddr::V4(network.addr()))
+                .chain(
+                    interface
+                        .ipv6
+                        .into_iter()
+                        .map(|network| IpAddr::V6(network.addr())),
+                )
+                .collect();
+            (interface.index, addrs)
+        })
+        .collect()
+}
+
+fn publish_discoverer(address_lookup: &DropGuard, data: &EndpointData, filter: &AddrFilter) {
+    address_lookup.remove_all();
+    let data = data.apply_filter(filter).into_owned();
+    for (port, addrs) in MdnsAddressLookup::socketaddrs_to_addrs(data.ip_addrs()) {
+        address_lookup.add(port, addrs);
+    }
+    if let Some(relay) = data.relay_urls().next()
+        && let Err(err) = address_lookup
+            .set_txt_attribute(RELAY_URL_ATTRIBUTE.to_string(), Some(relay.to_string()))
+    {
+        warn!("Failed to set the relay url in mDNS: {err:?}");
+    }
+    if let Some(user_data) = data.user_data()
+        && let Err(err) = address_lookup
+            .set_txt_attribute(USER_DATA_ATTRIBUTE.to_string(), Some(user_data.to_string()))
+    {
+        warn!("Failed to set the user-defined data in mDNS: {err:?}");
     }
 }
 
@@ -670,6 +775,189 @@ mod tests {
             assert_eq!(s1_endpoint_info.data, endpoint_data);
             assert_eq!(s2_endpoint_info.data, endpoint_data);
 
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn mdns_new_lookup_uses_changed_peer_address() -> Result {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1u64);
+            let (_, listener) = make_address_lookup(&mut rng, false)?;
+            let (peer_id, publisher) = make_address_lookup(&mut rng, true)?;
+            let mut events = listener.subscribe().await;
+
+            for port in [11111, 22222] {
+                let address: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+                let data = EndpointData::from_iter([TransportAddr::Ip(address)]);
+                publisher.publish(&data);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let event = events.next().await.expect("discovery stream closed");
+                        if let DiscoveryEvent::Discovered { endpoint_info, .. } = event
+                            && endpoint_info.endpoint_id == peer_id
+                            && endpoint_info.data == data
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .std_context("changed address was not announced")?;
+            }
+
+            let mut lookup = listener.resolve(peer_id).unwrap();
+            let item = tokio::time::timeout(Duration::from_secs(2), lookup.next())
+                .await
+                .std_context("cached lookup timed out")?
+                .expect("lookup stream closed")?;
+            assert_eq!(
+                item.endpoint_info()
+                    .data
+                    .ip_addrs()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec!["0.0.0.0:22222".parse::<SocketAddr>().unwrap()]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn replacing_interfaces_expires_old_peers_and_ignores_old_callbacks() -> Result {
+            let peer_id = SecretKey::from_bytes(&[73; 32]).public();
+            let listener = MdnsAddressLookup::builder()
+                .advertise(false)
+                .service_name("mdns-replace-regression")
+                .build(SecretKey::from_bytes(&[74; 32]).public())?;
+            let publisher = MdnsAddressLookup::builder()
+                .service_name("mdns-replace-regression")
+                .build(peer_id)?;
+            let mut events = listener.subscribe().await;
+
+            // Capture a real upstream Peer snapshot to simulate a delayed callback
+            // from the discoverer that is about to be replaced.
+            let peer_name = data_encoding::BASE32_NOPAD
+                .encode(peer_id.as_bytes())
+                .to_ascii_lowercase();
+            let (capture, mut captured) = mpsc::unbounded_channel();
+            let wanted = peer_name.clone();
+            let observer = Discoverer::new_interactive(
+                "mdns-replace-regression".to_string(),
+                "observer".to_string(),
+            )
+            .with_ip_class(IpClass::Auto)
+            .with_cadence(Duration::from_millis(100))
+            .with_response_rate(10.0)
+            .with_callback(move |name: &str, peer: &Peer| {
+                if name == wanted {
+                    capture.send(peer.clone()).ok();
+                }
+            })
+            .spawn(&tokio::runtime::Handle::current())
+            .std_context("spawn peer observer")?;
+            publisher.publish(&EndpointData::from_iter([TransportAddr::Ip(
+                "0.0.0.0:11111".parse().unwrap(),
+            )]));
+            let peer = tokio::time::timeout(Duration::from_secs(5), captured.recv())
+                .await
+                .std_context("capture peer")?
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = events.next().await {
+                    if matches!(event, DiscoveryEvent::Discovered { endpoint_info, .. }
+                        if endpoint_info.endpoint_id == peer_id)
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .std_context("learn peer")?;
+            drop(publisher);
+            let expired = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let peer = captured.recv().await.expect("observer stopped");
+                    if peer.is_expiry() {
+                        break peer;
+                    }
+                }
+            })
+            .await
+            .std_context("capture expiry callback")?;
+            drop(observer);
+
+            // Give the real snapshot a second identity that has no publisher.
+            // No native expiry callback can remove this cache entry, so only
+            // replacement's cache drain can produce its Expired event.
+            let peer_id = SecretKey::from_bytes(&[75; 32]).public();
+            let peer_name = data_encoding::BASE32_NOPAD
+                .encode(peer_id.as_bytes())
+                .to_ascii_lowercase();
+            listener
+                .sender
+                .send(Message::Discovered(0, peer_name.clone(), peer.clone()))
+                .await
+                .std_context("cache absent peer")?;
+            let mut cached_lookup = listener.resolve(peer_id).unwrap();
+            let cached = tokio::time::timeout(Duration::from_millis(250), cached_lookup.next())
+                .await
+                .std_context("peer was not cached before replacement")?
+                .unwrap()?;
+            assert_eq!(cached.endpoint_info().endpoint_id, peer_id);
+            drop(cached_lookup);
+
+            listener
+                .sender
+                .send(Message::NetworkChanged(NetworkState::default()))
+                .await
+                .std_context("replace interfaces")?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = events.next().await {
+                    if matches!(event, DiscoveryEvent::Expired { endpoint_id } if endpoint_id == peer_id) {
+                        break;
+                    }
+                }
+            }).await.std_context("expire old peer")?;
+
+            listener
+                .sender
+                .send(Message::Discovered(0, peer_name.clone(), peer.clone()))
+                .await
+                .std_context("deliver old callback")?;
+            let mut lookup = listener.resolve(peer_id).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), lookup.next())
+                    .await
+                    .is_err(),
+                "an old discoverer callback restored a stale cached peer"
+            );
+
+            listener
+                .sender
+                .send(Message::Discovered(1, peer_name.clone(), peer))
+                .await
+                .std_context("deliver current callback")?;
+            listener
+                .sender
+                .send(Message::Discovered(0, peer_name, expired))
+                .await
+                .std_context("deliver old expiry callback")?;
+            // A stable network poll must not rebuild the discoverer or drain its cache.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let mut fresh_lookup = listener.resolve(peer_id).unwrap();
+            let current = tokio::time::timeout(Duration::from_millis(250), fresh_lookup.next())
+                .await
+                .std_context("old expiry removed current peer")?
+                .unwrap()?;
+            assert_eq!(
+                current
+                    .endpoint_info()
+                    .data
+                    .ip_addrs()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec!["0.0.0.0:11111".parse::<SocketAddr>().unwrap()]
+            );
             Ok(())
         }
 
