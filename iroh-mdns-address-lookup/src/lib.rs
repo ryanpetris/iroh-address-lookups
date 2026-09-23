@@ -55,7 +55,7 @@
 //! [`RelayUrl`]: iroh_base::RelayUrl
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     str::FromStr,
     sync::Arc,
 };
@@ -111,7 +111,7 @@ pub struct MdnsAddressLookup {
 
 #[derive(Debug)]
 enum Message {
-    InterfacesChanged(Interfaces),
+    NetworkChanged(NetworkState),
     Discovered(u64, String, Peer),
     Resolve(
         EndpointId,
@@ -277,7 +277,7 @@ impl MdnsAddressLookup {
         let (send, mut recv) = mpsc::channel(64);
         let task_sender = send.clone();
         let rt = tokio::runtime::Handle::current();
-        let mut current_interfaces = local_interfaces();
+        let mut current_network = local_network();
         let mut generation = 0;
         let mut address_lookup = MdnsAddressLookup::spawn_discoverer(
             endpoint_id,
@@ -290,30 +290,29 @@ impl MdnsAddressLookup {
         let local_addrs: Watchable<Option<EndpointData>> = Watchable::default();
         let mut addrs_change = local_addrs.watch();
         let address_lookup_fut = async move {
-            let interface_sender = task_sender.clone();
-            let _interface_monitor = AbortOnDropHandle::new(task::spawn(async move {
-                let monitor = match netwatch::netmon::Monitor::new().await {
-                    Ok(monitor) => monitor,
-                    Err(error) => {
-                        warn!(?error, "could not monitor mDNS interfaces");
-                        return;
-                    }
-                };
-                let mut changes = monitor.interface_state();
+            // Route-only changes may not update netwatch's published interface state.
+            let network_sender = task_sender.clone();
+            let mut observed_network = current_network.clone();
+            let _network_monitor = AbortOnDropHandle::new(task::spawn(async move {
+                let mut poll = time::interval(Duration::from_secs(1));
+                poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
                 loop {
-                    if interface_sender
-                        .send(Message::InterfacesChanged(local_interfaces()))
+                    poll.tick().await;
+                    let network = local_network();
+                    if network == observed_network {
+                        continue;
+                    }
+                    observed_network = network.clone();
+                    if network_sender
+                        .send(Message::NetworkChanged(network))
                         .await
                         .is_err()
                     {
                         break;
                     }
-                    if changes.updated().await.is_err() {
-                        break;
-                    }
                 }
             }));
-            let mut pending_interfaces = None;
+            let mut pending_network = None;
             let mut retry = time::interval(Duration::from_secs(1));
             retry.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             let mut endpoint_addrs: HashMap<PublicKey, Peer> = HashMap::default();
@@ -327,8 +326,8 @@ impl MdnsAddressLookup {
             loop {
                 trace!(?endpoint_addrs, "Mdns Service loop tick");
                 let msg = tokio::select! {
-                    _ = retry.tick(), if pending_interfaces.is_some() => {
-                        Some(Message::InterfacesChanged(pending_interfaces.take().unwrap()))
+                    _ = retry.tick(), if pending_network.is_some() => {
+                        Some(Message::NetworkChanged(pending_network.take().unwrap()))
                     }
                     msg = recv.recv() => {
                         msg
@@ -350,12 +349,12 @@ impl MdnsAddressLookup {
                     Some(msg) => msg,
                 };
                 match msg {
-                    Message::InterfacesChanged(interfaces) => {
-                        if interfaces == current_interfaces {
-                            pending_interfaces = None;
+                    Message::NetworkChanged(network) => {
+                        if network == current_network {
+                            pending_network = None;
                             continue;
                         }
-                        debug!(?interfaces, "updating mDNS interfaces");
+                        debug!(?network, "updating mDNS network");
                         match Self::spawn_discoverer(
                             endpoint_id,
                             task_sender.clone(),
@@ -365,8 +364,8 @@ impl MdnsAddressLookup {
                         ) {
                             Ok(replacement) => {
                                 address_lookup = replacement;
-                                current_interfaces = interfaces;
-                                pending_interfaces = None;
+                                current_network = network;
+                                pending_network = None;
                                 generation += 1;
                                 // The replaced discoverer can no longer expire its peers.
                                 for (endpoint_id, _) in endpoint_addrs.drain() {
@@ -379,7 +378,7 @@ impl MdnsAddressLookup {
                             Err(error) => {
                                 // A replacement interface may exist before its multicast
                                 // route. Retry without discarding the old cache or generation.
-                                pending_interfaces = Some(interfaces);
+                                pending_network = Some(network);
                                 warn!(?error, "could not update mDNS interfaces; retrying");
                             }
                         }
@@ -566,9 +565,28 @@ impl MdnsAddressLookup {
 }
 
 // Include the OS index: an interface can be replaced while keeping its addresses.
-type Interfaces = BTreeMap<u32, BTreeSet<IpAddr>>;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NetworkState {
+    interfaces: BTreeMap<u32, BTreeSet<IpAddr>>,
+    multicast_v4_source: Option<IpAddr>,
+}
 
-fn local_interfaces() -> Interfaces {
+fn local_network() -> NetworkState {
+    // Auto can start with only IPv6 while the IPv4 multicast route is missing.
+    // Watch route choice too, so restoring that route reopens the IPv4 receiver.
+    // UDP connect selects a route without sending packets or joining the group.
+    let multicast_v4_source = (|| {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        socket.connect((Ipv4Addr::new(224, 0, 0, 251), 5353)).ok()?;
+        Some(socket.local_addr().ok()?.ip())
+    })();
+    NetworkState {
+        interfaces: local_interfaces(),
+        multicast_v4_source,
+    }
+}
+
+fn local_interfaces() -> BTreeMap<u32, BTreeSet<IpAddr>> {
     netdev::get_interfaces()
         .into_iter()
         .filter(|interface| interface.is_up() && interface.is_multicast())
@@ -890,7 +908,7 @@ mod tests {
 
             listener
                 .sender
-                .send(Message::InterfacesChanged(Interfaces::new()))
+                .send(Message::NetworkChanged(NetworkState::default()))
                 .await
                 .std_context("replace interfaces")?;
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -924,6 +942,8 @@ mod tests {
                 .send(Message::Discovered(0, peer_name, expired))
                 .await
                 .std_context("deliver old expiry callback")?;
+            // A stable network poll must not rebuild the discoverer or drain its cache.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
             let mut fresh_lookup = listener.resolve(peer_id).unwrap();
             let current = tokio::time::timeout(Duration::from_millis(250), fresh_lookup.next())
                 .await
